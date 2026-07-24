@@ -4,7 +4,7 @@ import { loadResume } from "../src/data";
 import { buildTemplate, normalizeTemplate } from "../src/ooxml";
 
 const source =
-  process.argv[2] ?? "Daniel MEDINA - product manager - Resume Bordeaux FR 2026.docx";
+  process.argv[2] ?? process.env.RESUME_SOURCE ?? "resume.docx";
 const target = process.argv[3] ?? "templates/resume-template.docx";
 
 await mkdir(dirname(target), { recursive: true });

@@ -10,7 +10,7 @@ const options = parseArgs(process.argv.slice(2));
 const basePath = stringOption(options, "base") ?? "data/resume.base.yaml";
 const templatePath = stringOption(options, "template") ?? "templates/resume-template.docx";
 const sourceDocx =
-  stringOption(options, "source") ?? "Daniel MEDINA - product manager - Resume Bordeaux FR 2026.docx";
+  stringOption(options, "source") ?? process.env.RESUME_SOURCE ?? "resume.docx";
 const jobPath = required(stringOption(options, "job"), "--job is required.");
 const slug = basename(jobPath).replace(/\.[^.]+$/, "");
 const outputDir = stringOption(options, "output") ?? join("output", slug);

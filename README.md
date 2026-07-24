@@ -12,9 +12,7 @@ See [WEB.md](WEB.md) for web setup and deployment.
 
 ## Architecture
 
-- `my_background.md`: evidence reservoir for truthful positioning.
-- `data/resume.base.yaml`: editable text currently displayed in the CV.
-- `templates/resume-template.docx`: original design with text placeholders.
+- private profile sources: local evidence and editable document template.
 - target brief: requirements and context for one application.
 - proposal JSON: temporary, reviewable document edit.
 - output YAML, review, and DOCX: approved application package.
@@ -25,14 +23,15 @@ contact details, and existing metrics remain protected. Startup role titles are
 flexible positioning labels and may be reframed from evidenced responsibilities;
 every change remains reviewable. Output is capped at two readable pages.
 
-## Sources
+## Private inputs
 
-- [`my_background.md`](my_background.md) — broader professional context.
-- [`Daniel MEDINA - product manager - Resume Bordeaux FR 2026.pdf`](Daniel%20MEDINA%20-%20product%20manager%20-%20Resume%20Bordeaux%20FR%202026.pdf) — current French CV.
-- [`GUIDELINES.md`](GUIDELINES.md) — truth, positioning, personalization, and automation rules.
-- [`WORKFLOW.md`](WORKFLOW.md) — mandatory research, tailoring, and verification gates.
+Profile sources, document templates, and generated application files stay local
+and are intentionally excluded from the public repository. Provide them through
+the local workspace or private deployment volume.
 
-These sources can conflict. Conflicts must be surfaced and resolved; they must not be silently optimized.
+`WORKFLOW.md` describes the public workflow contract. Private source documents
+may conflict; conflicts must be surfaced and resolved rather than silently
+optimized.
 
 ## Product stance
 

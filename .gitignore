@@ -4,3 +4,13 @@ dist/
 data/runtime/
 .env
 .DS_Store
+
+# Local personal career sources and generated application documents
+/my_background.md
+/GUIDELINES.md
+/AGENTS.md
+/*Resume*.docx
+/*Resume*.pdf
+/data/resume.base.yaml
+/templates/resume-template.docx
+/fixtures/*proposal.json

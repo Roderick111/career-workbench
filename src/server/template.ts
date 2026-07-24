@@ -125,9 +125,9 @@ export function profileFromStarterResume(resume: Resume): WebProfile {
 
   return {
     personal: {
-      name: "Daniel MEDINA",
+      name: process.env.STARTER_PROFILE_NAME ?? "Candidate",
       headline,
-      email: "nex.mod.daniel@gmail.com",
+      email: process.env.STARTER_PROFILE_EMAIL ?? "",
       phone,
       location,
       links: "linkedin | Portfolio web-site | Github",
