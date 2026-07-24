@@ -2,6 +2,7 @@ import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import type {
   FitReport,
+  ResearchSource,
   TailoringEdit,
   TailoringProposal,
   TemplateSlot,
@@ -9,6 +10,7 @@ import type {
 } from "../web-types";
 import { db, id, json, now, artifactsDir } from "./db";
 import { requestJson, requestText } from "./openrouter";
+import { logEvent } from "./observability";
 import { extractDocxText, renderMappedTemplate, safeFilename, sha256 } from "./template";
 
 interface ApplicationRow {
@@ -22,6 +24,7 @@ interface ApplicationRow {
   language: string;
   reuse_company_context: number;
   status: string;
+  user_comment: string;
   fit_json: string | null;
   proposal_json: string | null;
 }
@@ -161,17 +164,69 @@ export function consumeWorkflowCredit(userId: string, applicationId: string): vo
   ).run(id(), userId, applicationId, now());
 }
 
-export async function extractProfileFromText(userId: string, text: string): Promise<WebProfile> {
-  const schema = profileSchema();
-  const result = await requestJson<WebProfile>({
-    operation: "profile_extract",
+export interface ProfileReconciliationResult {
+  profile: WebProfile;
+  model: string;
+  warnings: string[];
+  reviewPaths: string[];
+}
+
+interface ProfileReconciliationPayload {
+  profile: WebProfile;
+  warnings: string[];
+}
+
+export async function reconcileProfileFromText(
+  userId: string,
+  current: WebProfile,
+  text: string,
+  requestId?: string,
+): Promise<ProfileReconciliationResult> {
+  const result = await requestJson<ProfileReconciliationPayload>({
+    operation: "profile_reconcile",
     userId,
-    system:
-      "Extract only facts present in the CV text. Never infer dates, employers, metrics, credentials, authority, or language levels. Preserve original wording where uncertain. Return strict JSON.",
-    prompt: `Extract a reusable CV profile from this text.\n\n${text.slice(0, 60_000)}`,
-    schema,
+    requestId,
+    system: `Reconcile one imported career document into an existing canonical career profile.
+
+Return one complete updated profile, not a patch and not a second profile.
+
+Rules:
+- Use only facts present in the current profile or imported source.
+- Preserve existing facts when the imported source is silent.
+- Update and enrich matching experiences and projects instead of duplicating them.
+- Match employers despite descriptors, product names, punctuation, translated names, or alternative role labels.
+- Keep only the canonical employer name in company; move descriptors into context.
+- Reuse the current id for every matching experience and project.
+- Use an empty id for genuinely new experiences and projects; the server assigns it.
+- Preserve current identity details and all existing records.
+- Deduplicate semantically equivalent bullets and list entries while retaining distinct evidence.
+- Treat alternative CV job titles as possible positioning, not automatic factual corrections.
+- If dates, employers, titles, credentials, or other facts conflict, choose the most defensible wording and explain the conflict in warnings.
+- Field-specific warnings must begin with the canonical field path, for example 'experiences.exp-2.role: ...'.
+- Never invent authority, dates, employers, credentials, metrics, language levels, outcomes, or responsibilities.
+- The background field preserves useful factual context not represented elsewhere.
+- The rules field contains candidate-authored tailoring preferences only.
+
+Example: "Sally – AI Sales Representative | Business Development Manager" can describe employer Sally, context AI Sales Representative, and role Business Development Manager. It must not create a second employer when Sally already exists.`,
+    prompt: buildProfileReconciliationPrompt(current, text),
+    schema: profileReconciliationSchema(),
+    maxTokens: 8000,
   });
-  return validateProfile(result.value);
+  const reconciled = validateReconciledProfile(result.value, current);
+  return {
+    ...reconciled,
+    model: result.model,
+  };
+}
+
+export function buildProfileReconciliationPrompt(current: WebProfile, text: string): string {
+  return `CURRENT CANONICAL PROFILE:
+${JSON.stringify(validateProfile(structuredClone(current)))}
+
+NEW IMPORTED SOURCE:
+${text.slice(0, 60_000)}
+
+Return the complete reconciled profile and concise warnings.`;
 }
 
 async function processNext(): Promise<void> {
@@ -213,36 +268,48 @@ async function research(application: ApplicationRow): Promise<void> {
         .get(application.user_id, application.company_key) as { content_md: string } | null)
     : null;
 
-  let companyResearch = saved?.content_md ?? "";
+  let companyResearch =
+    saved?.content_md && !hasUnresolvedWebToolCall(saved.content_md) ? saved.content_md : "";
   let sources: FitReport["sources"] = [];
   if (!companyResearch) {
-    const result = await requestText({
+    const prompt = buildCompanyResearchPrompt(
+      application.company,
+      application.role,
+      application.job_text,
+    );
+    let result = await requestText({
       operation: "company_research",
       userId: application.user_id,
       applicationId: application.id,
       webSearch: true,
       system:
-        "Research companies for job candidates. Search current official sources first, then credible recent reporting. Do not search LinkedIn or personal information. Cite factual claims and distinguish facts from inference.",
-      prompt: `Research ${application.company} for this role: ${application.role}.
-
-Explain:
-- what the company does;
-- current strategy, products, and market;
-- recent challenges or priorities relevant to this role;
-- likely reason this position exists.
-
-JOB POST:
-${application.job_text.slice(0, 30_000)}`,
+        "Research companies for job candidates. Use supplied web results and return the final research brief, never tool-call syntax. Prioritize official company sources, then credible recent reporting. Do not search LinkedIn or personal information. Cite factual claims with Markdown links and distinguish facts from inference.",
+      prompt,
     });
-    companyResearch = result.value;
-    sources = result.annotations
-      .map((annotation) => annotation.url_citation)
-      .filter((source): source is NonNullable<typeof source> => Boolean(source?.url))
-      .map((source) => ({
-        title: source.title ?? source.url ?? "Source",
-        url: source.url ?? "",
-        content: source.content,
-      }));
+    let validated: { content: string; sources: ResearchSource[] };
+    try {
+      validated = validateCompanyResearch(result.value, result.annotations, application.company);
+    } catch (error) {
+      logEvent("warn", "company_research.rejected", {
+        applicationId: application.id,
+        userId: application.user_id,
+        model: result.model,
+        reason: error instanceof Error ? error.message : String(error),
+      });
+      result = await requestText({
+        operation: "company_research_retry",
+        userId: application.user_id,
+        applicationId: application.id,
+        webSearch: true,
+        preferFallback: true,
+        system:
+          "Return a finished company research brief using supplied web results. Never output function calls, XML tool syntax, search plans, or uncited claims. Use Markdown links. Prioritize official company sources and distinguish facts from inference.",
+        prompt,
+      });
+      validated = validateCompanyResearch(result.value, result.annotations, application.company);
+    }
+    companyResearch = validated.content;
+    sources = validated.sources;
     saveDocument(
       application.user_id,
       "company_context",
@@ -291,6 +358,97 @@ ${JSON.stringify(profile)}`,
   );
 }
 
+export function buildCompanyResearchPrompt(company: string, role: string, jobText: string): string {
+  return `Research the exact company "${company}" for this role: "${role}".
+
+Search using the exact company name. Prefer the official company website, official reports, and relevant recent business or trade reporting. Ignore results about similarly named entities.
+
+Return a concise final brief covering:
+- what the company does;
+- current strategy, products, and market;
+- recent challenges or priorities relevant to this role;
+- likely reason this position exists.
+
+Use Markdown links for every source. Return prose only, never a search plan or tool-call markup.
+
+ROLE CONTEXT EXCERPT:
+${jobText.slice(0, 2_500)}`;
+}
+
+export function validateCompanyResearch(
+  content: string,
+  annotations: Array<{
+    type?: string;
+    url_citation?: { url?: string; title?: string; content?: string };
+  }>,
+  company: string,
+): { content: string; sources: ResearchSource[] } {
+  if (hasUnresolvedWebToolCall(content)) {
+    throw new Error("Research returned an unresolved web-search tool call.");
+  }
+  if (content.trim().length < 300) throw new Error("Research response is too short.");
+
+  const sources = annotations
+    .map((annotation) => annotation.url_citation)
+    .filter(
+      (source): source is { url: string; title?: string; content?: string } =>
+        Boolean(source?.url) &&
+        content.includes(source!.url!) &&
+        sourceRelevantToCompany(source!, company),
+    )
+    .map((source) => ({
+      title: source.title ?? source.url,
+      url: source.url,
+      content: source.content,
+    }));
+  const unique = [...new Map(sources.map((source) => [source.url, source])).values()];
+  if (!unique.length) {
+    throw new Error("Research contained no cited source relevant to the company.");
+  }
+  return { content: content.trim(), sources: unique };
+}
+
+function hasUnresolvedWebToolCall(content: string): boolean {
+  return /<function_calls>|<invoke\s+name=["']?web_search|<parameter\s+name=["']?query|tool_calls/i.test(
+    content,
+  );
+}
+
+function sourceRelevantToCompany(
+  source: { url?: string; title?: string; content?: string },
+  company: string,
+): boolean {
+  if (!source.url) return false;
+  const stopWords = new Set([
+    "company",
+    "corporation",
+    "group",
+    "groupe",
+    "holding",
+    "inc",
+    "limited",
+    "ltd",
+    "sas",
+    "societe",
+  ]);
+  const terms = normalizedWords(company).filter((term) => term.length >= 3 && !stopWords.has(term));
+  if (!terms.length) return false;
+  const sourceWords = new Set(
+    normalizedWords(`${source.title ?? ""} ${source.url} ${source.content ?? ""}`),
+  );
+  const matches = terms.filter((term) => sourceWords.has(term)).length;
+  return matches >= Math.min(2, terms.length);
+}
+
+function normalizedWords(value: string): string[] {
+  return value
+    .normalize("NFKD")
+    .replace(/\p{Diacritic}/gu, "")
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter(Boolean);
+}
+
 async function tailor(application: ApplicationRow): Promise<void> {
   transition(application.id, "tailor_queued", "tailoring");
   const profile = loadProfile(application.user_id);
@@ -307,7 +465,7 @@ async function tailor(application: ApplicationRow): Promise<void> {
     userId: application.user_id,
     applicationId: application.id,
     system:
-      "Tailor a CV with confident, creative positioning but no fabrication. Startup role titles may change only when broad evidenced responsibilities support the new lens. Never change identity, employers, dates, locations, education, credentials, metrics, or unsupported authority. Return only useful edits.",
+      "Tailor a CV with confident, creative positioning but no fabrication. Startup role titles may change only when broad evidenced responsibilities support the new lens. Use only natural, established market titles that stand on their own. Never mechanically combine words from the job post with the existing title to manufacture a hybrid title; never output awkward keyword titles such as 'Chef de Projet Produit'. Prefer the original title when no clearly better standard title exists, and put target keywords in the bullets instead. Skill categories are dynamic: regroup, rename, reorder, or omit them according to the target role instead of forcing fixed categories such as Finance, Techniques, or Gestion de Produit. Infer concise capability labels from demonstrated work and add relevant ATS keywords when they accurately summarize that evidence, even if the exact phrase is absent. Distinguish hands-on expertise from project exposure or familiarity with a technology environment. Never add unsupported technologies, methodologies, domains, certifications, seniority, authority, metrics, or responsibilities. Never change identity, employers, dates, locations, education, or credentials. Return at most 8 material edits. Never return unchanged text. Do not add guarantees, process steps, delivery stages, budgets, quality ownership, KPIs, reporting, or responsibilities unless explicit in the same experience or project evidence.",
     prompt: `Write in ${targetLanguage(application.language, application.job_text)}.
 Keep the CV concise and likely within two pages. Do not blindly copy the job post.
 
@@ -319,6 +477,9 @@ ${application.job_text}
 
 BACKGROUND:
 ${profile.background}
+
+USER INSTRUCTIONS (additional guidance only; do not replace the job post, research, profile, or existing facts):
+${application.user_comment?.trim() || "(none)"}
 
 ONLY THESE PATHS MAY CHANGE:
 ${JSON.stringify(allowed)}
@@ -426,7 +587,7 @@ function saveDocument(
   ).run(id(), userId, kind, title, companyKey, applicationId, content, timestamp, timestamp);
 }
 
-function validateProfile(value: WebProfile): WebProfile {
+export function validateProfile(value: WebProfile): WebProfile {
   if (!value?.personal || !Array.isArray(value.experiences)) throw new Error("Invalid profile.");
   value.personal.name = String(value.personal.name ?? "");
   value.personal.headline = String(value.personal.headline ?? "");
@@ -437,9 +598,15 @@ function validateProfile(value: WebProfile): WebProfile {
   value.summary = String(value.summary ?? "");
   value.background = String(value.background ?? "");
   value.education = stringArray(value.education);
+  value.certifications = stringArray(value.certifications);
   value.skills = stringArray(value.skills);
   value.languages = stringArray(value.languages);
-  value.rules = stringArray(value.rules);
+  value.rules = stringArray(value.rules).filter(
+    (rule) =>
+      !/extract only facts|never infer|preserve original wording|return strict json|extraction instructions/i.test(
+        rule,
+      ),
+  );
   value.experiences = value.experiences.map((experience, index) => ({
     id: experience.id || `experience-${index + 1}`,
     company: String(experience.company ?? ""),
@@ -448,6 +615,13 @@ function validateProfile(value: WebProfile): WebProfile {
     role: String(experience.role ?? ""),
     period: String(experience.period ?? ""),
     bullets: stringArray(experience.bullets),
+  }));
+  value.projects = (Array.isArray(value.projects) ? value.projects : []).map((project, index) => ({
+    id: project.id || `project-${index + 1}`,
+    name: String(project.name ?? ""),
+    context: String(project.context ?? ""),
+    period: String(project.period ?? ""),
+    bullets: stringArray(project.bullets),
   }));
   return value;
 }
@@ -469,20 +643,193 @@ export function validateTailoringProposal(
     throw new Error("Invalid tailoring proposal.");
   }
   const edits: TailoringEdit[] = [];
+  const seen = new Set<string>();
   for (const edit of value.edits) {
     if (!allowed.has(edit.path)) throw new Error(`Proposal changed protected field: ${edit.path}`);
     const current = getPath(profile, edit.path);
     if (typeof current !== "string" || current !== edit.oldText) {
       throw new Error(`Proposal oldText mismatch: ${edit.path}`);
     }
-    if (!edit.newText.trim()) continue;
+    if (!edit.newText.trim() || normalizedText(edit.newText) === normalizedText(edit.oldText)) continue;
+    if (seen.has(edit.path)) continue;
     if (edit.evidence === "unsupported") {
       value.warnings.push(`Rejected unsupported edit: ${edit.path}`);
       continue;
     }
-    edits.push(edit);
+    if (introducesUnsupportedClaim(edit.newText, evidenceForPath(profile, edit.path))) {
+      value.warnings.push(`Rejected unsupported claim expansion: ${edit.path}`);
+      continue;
+    }
+    seen.add(edit.path);
+    if (edits.length < 8) edits.push(edit);
   }
   return { edits, warnings: stringArray(value.warnings) };
+}
+
+export function validateReconciledProfile(
+  value: ProfileReconciliationPayload,
+  currentValue: WebProfile,
+): { profile: WebProfile; warnings: string[]; reviewPaths: string[] } {
+  if (!value || !Array.isArray(value.warnings)) throw new Error("Invalid profile reconciliation.");
+  const current = validateProfile(structuredClone(currentValue));
+  const profile = validateProfile(structuredClone(value.profile));
+  const warnings = stringArray(value.warnings);
+  const reviewPaths = new Set<string>(pathsFromWarnings(warnings));
+
+  for (const key of ["name", "email", "phone"] as const) {
+    if (
+      current.personal[key].trim() &&
+      normalizedText(current.personal[key]) !== normalizedText(profile.personal[key])
+    ) {
+      throw new Error(`Reconciliation changed protected identity field: personal.${key}`);
+    }
+  }
+
+  validateExistingRecords(
+    current.experiences,
+    profile.experiences,
+    "experience",
+    warnings,
+    reviewPaths,
+    ["company", "role", "period"],
+  );
+  validateExistingRecords(
+    current.projects,
+    profile.projects,
+    "project",
+    warnings,
+    reviewPaths,
+    ["name", "period"],
+  );
+  assignNewIds(profile.experiences, new Set(current.experiences.map((item) => item.id)), "experience");
+  assignNewIds(profile.projects, new Set(current.projects.map((item) => item.id)), "project");
+
+  for (const key of ["education", "certifications", "skills", "languages", "rules"] as const) {
+    for (const removed of removedStrings(current[key], profile[key])) {
+      warnings.push(`${key} entry removed: ${removed}`);
+      reviewPaths.add(key);
+    }
+  }
+  if (current.summary.trim() && !profile.summary.trim()) {
+    warnings.push("Existing summary was removed.");
+    reviewPaths.add("summary");
+  }
+  if (current.background.trim() && !profile.background.trim()) {
+    warnings.push("Existing background was removed.");
+    reviewPaths.add("background");
+  }
+
+  return { profile, warnings: [...new Set(warnings)], reviewPaths: [...reviewPaths] };
+}
+
+function validateExistingRecords<T extends { id: string; bullets: string[] }>(
+  current: T[],
+  next: T[],
+  kind: "experience" | "project",
+  warnings: string[],
+  reviewPaths: Set<string>,
+  comparedFields: string[],
+): void {
+  const nextIds = next.map((item) => item.id).filter(Boolean);
+  if (new Set(nextIds).size !== nextIds.length) throw new Error(`Duplicate ${kind} id.`);
+  for (const existing of current) {
+    const matches = next.filter((item) => item.id === existing.id);
+    if (matches.length !== 1) throw new Error(`Reconciliation lost existing ${kind}: ${existing.id}`);
+    const reconciled = matches[0]!;
+    for (const field of comparedFields) {
+      const before = String((existing as unknown as Record<string, unknown>)[field] ?? "");
+      const after = String((reconciled as unknown as Record<string, unknown>)[field] ?? "");
+      if (normalizedText(before) !== normalizedText(after)) {
+        warnings.push(`${kind} ${existing.id} ${field} changed: "${before}" → "${after}"`);
+        reviewPaths.add(`${kind === "experience" ? "experiences" : "projects"}.${existing.id}.${field}`);
+      }
+    }
+    for (const removed of removedStrings(existing.bullets, reconciled.bullets)) {
+      warnings.push(`${kind} ${existing.id} bullet removed: ${removed}`);
+      reviewPaths.add(`${kind === "experience" ? "experiences" : "projects"}.${existing.id}.bullets`);
+    }
+  }
+}
+
+function assignNewIds<T extends { id: string }>(
+  records: T[],
+  existingIds: Set<string>,
+  prefix: string,
+): void {
+  const used = new Set(existingIds);
+  for (const record of records) {
+    if (!record.id || !existingIds.has(record.id)) {
+      do record.id = `${prefix}-${crypto.randomUUID()}`;
+      while (used.has(record.id));
+    }
+    used.add(record.id);
+  }
+}
+
+function removedStrings(current: string[], next: string[]): string[] {
+  const nextValues = new Set(next.map(normalizedText));
+  return current.filter((item) => !nextValues.has(normalizedText(item)));
+}
+
+function pathsFromWarnings(warnings: string[]): string[] {
+  const paths = new Set<string>();
+  const pattern = /\b(?:personal|experiences|projects|summary|background|education|certifications|skills|languages|rules)(?:\.[A-Za-z0-9_-]+)*/g;
+  for (const warning of warnings) {
+    for (const match of warning.matchAll(pattern)) paths.add(match[0]);
+  }
+  return [...paths];
+}
+
+function normalizedText(value: string): string {
+  return value
+    .normalize("NFKD")
+    .replace(/\p{Diacritic}/gu, "")
+    .toLowerCase()
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function evidenceForPath(profile: WebProfile, path: string): string {
+  const experience = path.match(/^experiences\.(\d+)\./);
+  if (experience) {
+    const item = profile.experiences[Number(experience[1])];
+    return item ? Object.values(item).flat().join(" ") : "";
+  }
+  const project = path.match(/^projects\.(\d+)\./);
+  if (project) {
+    const item = profile.projects[Number(project[1])];
+    return item ? Object.values(item).flat().join(" ") : "";
+  }
+  const current = getPath(profile, path);
+  return typeof current === "string" ? current : "";
+}
+
+function introducesUnsupportedClaim(next: string, evidence: string): boolean {
+  const normalizedNext = normalizedText(next);
+  const normalizedEvidence = normalizedText(evidence);
+  const numbers = normalizedNext.match(/\b\d+(?:[.,]\d+)?%?\b/g) ?? [];
+  if (numbers.some((number) => !normalizedEvidence.includes(number))) return true;
+
+  const claimMarkers = [
+    "doubl",
+    "tripl",
+    "garant",
+    "kpi",
+    "reporting",
+    "budget",
+    "marge",
+    "charges",
+    "qualite",
+    "deploiement",
+    "specification",
+    "critere d'acceptation",
+    "engagement de resultats",
+    "cadrage projet",
+    "suivi de performance",
+  ];
+  return claimMarkers.some(
+    (marker) => normalizedNext.includes(marker) && !normalizedEvidence.includes(marker),
+  );
 }
 
 function targetLanguage(setting: string, job: string): string {
@@ -563,10 +910,33 @@ ${proposal.warnings.map((warning) => `- ${warning}`).join("\n") || "- None"}
 
 function profileSchema(): Record<string, unknown> {
   const stringArraySchema = { type: "array", items: { type: "string" } };
+  const portfolioItemSchema = {
+    type: "object",
+    additionalProperties: false,
+    required: ["id", "name", "context", "period", "bullets"],
+    properties: {
+      id: { type: "string" },
+      name: { type: "string" },
+      context: { type: "string" },
+      period: { type: "string" },
+      bullets: stringArraySchema,
+    },
+  };
   return {
     type: "object",
     additionalProperties: false,
-    required: ["personal", "summary", "background", "experiences", "education", "skills", "languages", "rules"],
+    required: [
+      "personal",
+      "summary",
+      "background",
+      "experiences",
+      "projects",
+      "education",
+      "certifications",
+      "skills",
+      "languages",
+      "rules",
+    ],
     properties: {
       personal: {
         type: "object",
@@ -600,10 +970,39 @@ function profileSchema(): Record<string, unknown> {
           },
         },
       },
-      education: stringArraySchema,
-      skills: stringArraySchema,
-      languages: stringArraySchema,
-      rules: stringArraySchema,
+      projects: { type: "array", items: portfolioItemSchema },
+      education: {
+        ...stringArraySchema,
+        description: "Every degree or education entry, preserving institution, program, and date.",
+      },
+      certifications: {
+        ...stringArraySchema,
+        description: "Every certification or professional training entry.",
+      },
+      skills: {
+        ...stringArraySchema,
+        description: "All explicit technical, product, business, finance, design, and domain skills.",
+      },
+      languages: {
+        ...stringArraySchema,
+        description: "Every language exactly as stated, including level only when explicit.",
+      },
+      rules: {
+        ...stringArraySchema,
+        description: "Candidate-authored tailoring preferences only; normally empty for a CV import.",
+      },
+    },
+  };
+}
+
+function profileReconciliationSchema(): Record<string, unknown> {
+  return {
+    type: "object",
+    additionalProperties: false,
+    required: ["profile", "warnings"],
+    properties: {
+      profile: profileSchema(),
+      warnings: { type: "array", items: { type: "string" } },
     },
   };
 }

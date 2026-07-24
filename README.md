@@ -1,12 +1,12 @@
-# Job Search Assistant
+# Career Workbench
 
-Evidence-first CV personalization that keeps the existing DOCX design.
+Evidence-first career document workbench that keeps the existing DOCX design.
 
 Two separate interfaces share CV principles:
 
 - Existing CLI remains personal, local, and formatting-preserving.
-- Invite-only web app supports friends with isolated profiles, private DOCX
-  templates, reusable Markdown research, and downloadable generated files.
+- Invite-only web app supports collaborators with isolated profiles, private
+  DOCX templates, reusable Markdown notes, and downloadable generated files.
 
 See [WEB.md](WEB.md) for web setup and deployment.
 
@@ -15,8 +15,8 @@ See [WEB.md](WEB.md) for web setup and deployment.
 - `my_background.md`: evidence reservoir for truthful positioning.
 - `data/resume.base.yaml`: editable text currently displayed in the CV.
 - `templates/resume-template.docx`: original design with text placeholders.
-- job post: target requirements.
-- proposal JSON: temporary, reviewable LLM edit.
+- target brief: requirements and context for one application.
+- proposal JSON: temporary, reviewable document edit.
 - output YAML, review, and DOCX: approved application package.
 
 YAML does not replace DOCX formatting. It controls only mutable text, ordering,
@@ -36,7 +36,7 @@ These sources can conflict. Conflicts must be surfaced and resolved; they must n
 
 ## Product stance
 
-Requirements are signals, not gates. The assistant should respond confidently
+Requirements are signals, not gates. The workbench should respond confidently
 to unrealistic job posts by proving equivalent competence. It may select an
 evidence-backed functional title for broad startup work, but never invent
 credentials, responsibilities, ownership, dates, or outcomes.
@@ -83,14 +83,8 @@ Generate Weplace test application from reviewed fixture:
 ~/.bun/bin/bun run personalize -- --job jobs/weplace-product-owner.md --proposal fixtures/weplace.proposal.json --approve
 ```
 
-Run with an OpenAI-compatible LLM:
-
-```bash
-LLM_API_KEY=... LLM_MODEL=... ~/.bun/bin/bun run personalize -- --job jobs/weplace-product-owner.md
-```
-
-`LLM_BASE_URL` defaults to OpenRouter. Without `--approve`, script writes and
-prints review, then requires confirmation before generating DOCX.
+The CLI writes a review before generating a document and requires confirmation
+before applying proposed changes.
 
 ## PDF export
 
@@ -107,11 +101,10 @@ tab alignment.
 ## Current test
 
 `jobs/weplace-product-owner.md` and `fixtures/weplace.proposal.json` exercise
-same validation and rendering path as live LLM output. Generated files live in
+the same validation and rendering path as live personalization. Generated files live in
 `output/weplace-product-owner/`.
 
 ## Later scope
 
-Deep decision-maker discovery, messaging, and job discovery stay separate from
-CV generation. Stage 1 includes only quick company research. Use permitted APIs
-or exports; never scrape or send externally without review.
+Research, messaging, and discovery stay separate from document generation.
+Use permitted APIs or exports; never scrape or send externally without review.

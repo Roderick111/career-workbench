@@ -16,6 +16,8 @@ COPY --from=build --chown=bun:bun /app/dist ./dist
 COPY --chown=bun:bun package.json bun.lock ./
 COPY --chown=bun:bun src ./src
 COPY --chown=bun:bun scripts ./scripts
+COPY --chown=bun:bun data/resume.base.yaml ./data/resume.base.yaml
+COPY --chown=bun:bun templates/resume-template.docx ./templates/resume-template.docx
 RUN mkdir -p /data && chown bun:bun /data
 USER bun
 EXPOSE 3000

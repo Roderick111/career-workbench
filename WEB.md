@@ -35,7 +35,7 @@ Remove `ALLOW_BOOTSTRAP_SIGNUP` and `ADMIN_PASSWORD` after command.
 
 1. Admin creates invite and sends URL manually.
 2. User imports factual profile and confirms it.
-3. User uploads personal DOCX or creates private starter.
+3. User uploads a DOCX or uses the starter based on the existing CV visual master.
 4. Mapping wizard marks protected and tailorable fields.
 5. User submits job posting.
 6. Company research is saved as reusable Markdown.
@@ -44,6 +44,21 @@ Remove `ALLOW_BOOTSTRAP_SIGNUP` and `ADMIN_PASSWORD` after command.
 
 Company context is reused by normalized company name. User can edit or download
 it from Personal space. No LinkedIn scraping or automatic application sending.
+
+Profile is the reusable career knowledge base, not only a set of CV fields. CV
+import sends the current canonical profile and raw source to one reconciliation
+agent using a strict schema. Matching records keep stable IDs; genuinely new
+records receive server-generated IDs. An empty profile is saved after successful
+reconciliation. Existing content becomes an unsaved draft and is never
+overwritten automatically.
+
+Profile import accepts DOCX, Markdown, TXT, or pasted text. Structured-profile
+mode uses the LLM. Context-notes mode appends the exact source text to the
+background draft without an LLM rewrite; the user reviews and saves it.
+
+Only one profile reconciliation can run per user. Recent operations are stored in
+SQLite and visible to admins with request ID, model, timing, input size, counts,
+and errors. CV text and credentials are not logged.
 
 Research first tries OpenRouter's current server-tool API. MiniMax/DeepSeek
 routing currently returns `404` for that combination, so adapter retries through

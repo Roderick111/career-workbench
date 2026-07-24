@@ -21,6 +21,7 @@ button, .button {
   justify-content: center;
 }
 button:hover, .button:hover { background: #143b2e; }
+button:disabled { cursor: not-allowed; opacity: .55; }
 button.secondary, .button.secondary { background: #e4e6df; color: #20211f; }
 button.quiet { background: transparent; color: #555b55; padding-left: 0; }
 button.inline, .button.inline { width: auto; }
@@ -35,6 +36,8 @@ input, textarea, select {
 }
 textarea { resize: vertical; line-height: 1.45; }
 label { display: grid; gap: 6px; margin: 10px 0; color: #50554f; font-size: 14px; }
+label > span { display: inline-flex; align-items: center; gap: 5px; }
+.review-marker { color: #d79b17; font-size: 16px; line-height: 1; }
 h1, h2, h3, p { margin-top: 0; }
 h1 { font-size: 34px; letter-spacing: -0.03em; }
 h2 { font-size: 20px; }
@@ -82,8 +85,17 @@ header { margin-bottom: 22px; }
 .list-row:hover { background: #fafbf8; }
 .status { padding: 5px 8px; border-radius: 999px; background: #e8ebe6; color: #59605a; font-size: 11px; white-space: nowrap; }
 .status-active, .status-complete, .status-research_ready, .status-proposal_ready { background: #daf0e4; color: #246343; }
+.status-saved, .status-succeeded { background: #daf0e4; color: #246343; }
+.status-unsaved, .status-saving, .status-running { background: #fff0ce; color: #805c16; }
 .status-failed { background: #f9dcdc; color: #9f2929; }
 .progress { border-left: 4px solid #d89d3d; }
+.notice { padding-top: 14px; padding-bottom: 14px; }
+.warning { border-left: 4px solid #c87b2e; background: #fffaf0; }
+.warning ul { margin-bottom: 0; }
+.progress-text { margin: 12px 0 0; }
+.progress-bar { height: 8px; margin-top: 16px; overflow: hidden; border-radius: 999px; background: #e7e9e3; }
+.progress-bar span { display: block; height: 100%; border-radius: inherit; background: #d89d3d; transition: width 1s linear; }
+.save-feedback { color: #246343; font-weight: 700; }
 .edit { border-top: 1px solid #eceee9; padding: 16px 0; }
 .removed, .added { padding: 9px 11px; border-radius: 6px; margin: 8px 0; }
 .removed { background: #fff0f0; text-decoration: line-through; }
@@ -92,6 +104,21 @@ header { margin-bottom: 22px; }
 .artifact > div { display: flex; align-items: center; gap: 10px; }
 .artifact .quota { width: 80px; }
 .experience { border-top: 1px solid #e3e6df; padding: 16px 0; }
+.operation-row { display: flex; justify-content: space-between; gap: 16px; padding: 12px 0; border-top: 1px solid #eceee9; }
+.operation-row > div:last-child { text-align: right; }
+.activation-area { display: grid; justify-items: start; gap: 10px; }
+.local-error { display: grid; gap: 4px; max-width: 720px; padding: 12px 14px; border-radius: 8px; background: #fff0f0; }
+.template-list { margin-bottom: 18px; }
+.profile-required {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 24px;
+  border-left: 4px solid #d89d3d;
+  background: #fffdf7;
+}
+.profile-required p:last-child { max-width: 660px; margin-bottom: 0; }
+.profile-required button { flex: 0 0 auto; }
 .mapping-list { padding: 0; overflow: hidden; }
 .mapping-row { display: grid; grid-template-columns: 1fr 320px; gap: 16px; align-items: center; padding: 12px 16px; border-bottom: 1px solid #eceee9; }
 .mapping-row p { margin: 0; font-size: 14px; }
@@ -102,13 +129,38 @@ header { margin-bottom: 22px; }
 .docx-preview { clear: both; background: #aaa; padding: 20px; overflow: auto; }
 
 @media (max-width: 760px) {
-  .app-shell { grid-template-columns: 1fr; }
-  aside { position: static; height: auto; min-height: 0; padding: 18px; display: block; }
-  aside nav { display: flex; flex-wrap: wrap; overflow: visible; margin: 16px 0 10px; }
+  .app-shell { grid-template-columns: 1fr; align-content: start; }
+  aside {
+    position: static;
+    height: auto;
+    min-height: 0;
+    padding: 16px;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 14px;
+    align-items: start;
+    align-content: start;
+    justify-content: normal;
+  }
+  aside nav {
+    grid-column: 1 / -1;
+    display: flex;
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    margin: 0;
+    padding-bottom: 2px;
+    align-items: center;
+  }
   aside nav button { flex: 0 0 auto; }
-  aside > button.quiet { margin-top: 4px; }
+  aside > button.quiet {
+    grid-column: 2;
+    grid-row: 1;
+    margin: 0;
+    padding: 8px;
+    align-self: start;
+  }
   main { padding: 22px 16px; }
   .grid.two, .split, .mapping-row { grid-template-columns: 1fr; }
-  header, .actions, .artifact { align-items: flex-start; flex-wrap: wrap; }
+  header, .actions, .artifact, .profile-required { align-items: flex-start; flex-wrap: wrap; }
   header h1 { font-size: 30px; }
 }

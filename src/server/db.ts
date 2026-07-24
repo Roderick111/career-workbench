@@ -122,7 +122,44 @@ export function migrateApplicationSchema(): void {
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
     );
+
+    CREATE TABLE IF NOT EXISTS operation_logs (
+      id TEXT PRIMARY KEY,
+      request_id TEXT NOT NULL,
+      user_id TEXT,
+      operation TEXT NOT NULL,
+      status TEXT NOT NULL,
+      input_name TEXT,
+      input_bytes INTEGER NOT NULL DEFAULT 0,
+      input_characters INTEGER NOT NULL DEFAULT 0,
+      details_json TEXT NOT NULL DEFAULT '{}',
+      error TEXT,
+      started_at TEXT NOT NULL,
+      completed_at TEXT,
+      duration_ms INTEGER
+    );
+    CREATE INDEX IF NOT EXISTS operation_logs_recent_idx
+      ON operation_logs(started_at DESC);
+    CREATE INDEX IF NOT EXISTS operation_logs_user_idx
+      ON operation_logs(user_id, started_at DESC);
+    CREATE UNIQUE INDEX IF NOT EXISTS operation_logs_active_idx
+      ON operation_logs(user_id, operation)
+      WHERE status = 'running';
   `);
+
+  const applicationColumns = db.query("PRAGMA table_info(applications)").all() as Array<{ name: string }>;
+  if (!applicationColumns.some((column) => column.name === "user_comment")) {
+    db.exec("ALTER TABLE applications ADD COLUMN user_comment TEXT NOT NULL DEFAULT ''");
+  }
+
+  db.query(
+    `UPDATE operation_logs
+     SET status = 'interrupted',
+         error = 'Server restarted before operation completed.',
+         completed_at = ?,
+         duration_ms = CAST((julianday(?) - julianday(started_at)) * 86400000 AS INTEGER)
+     WHERE status = 'running'`,
+  ).run(now(), now());
 }
 
 export function now(): string {

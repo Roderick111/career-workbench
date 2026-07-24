@@ -1,4 +1,5 @@
 import { db, id, now } from "./db";
+import { logEvent } from "./observability";
 
 interface Usage {
   prompt_tokens?: number;
@@ -38,10 +39,13 @@ interface RequestOptions {
   operation: string;
   userId: string;
   applicationId?: string;
+  requestId?: string;
   system: string;
   prompt: string;
   schema?: Record<string, unknown>;
   webSearch?: boolean;
+  preferFallback?: boolean;
+  maxTokens?: number;
 }
 
 const apiUrl = (process.env.OPENROUTER_BASE_URL ?? "https://openrouter.ai/api/v1").replace(/\/$/, "");
@@ -79,7 +83,11 @@ async function request(options: RequestOptions): Promise<{
   const key = process.env.OPENROUTER_API_KEY;
   if (!key) throw new Error("OPENROUTER_API_KEY is missing.");
 
-  const routing = openRouterRouting();
+  const configuredRouting = openRouterRouting();
+  const routing =
+    options.preferFallback && configuredRouting.length > 1
+      ? [configuredRouting[1], configuredRouting[0]]
+      : configuredRouting;
   const attempts = options.webSearch
     ? [
         ...routing.map((item) => ({ ...item, webMode: "server-tool" as const })),
@@ -89,6 +97,15 @@ async function request(options: RequestOptions): Promise<{
   let lastError: unknown;
 
   for (const { model, provider, webMode } of attempts) {
+    const attemptStartedAt = Date.now();
+    logEvent("info", "llm.attempt.started", {
+      requestId: options.requestId,
+      applicationId: options.applicationId,
+      userId: options.userId,
+      operation: options.operation,
+      model,
+      webMode,
+    });
     try {
       const response = await fetch(`${apiUrl}/chat/completions`, {
         method: "POST",
@@ -101,7 +118,7 @@ async function request(options: RequestOptions): Promise<{
         body: JSON.stringify({
           model,
           temperature: 0.2,
-          max_tokens: options.webSearch ? 3000 : 4500,
+          max_tokens: options.maxTokens ?? (options.webSearch ? 3000 : 4500),
           user: options.userId,
           provider,
           messages: [
@@ -161,6 +178,23 @@ async function request(options: RequestOptions): Promise<{
       if (!message?.content) throw new Error("OpenRouter returned no content.");
       const usage = payload.usage ?? {};
       recordUsage(options, payload.model ?? model, usage);
+      logEvent("info", "llm.attempt.succeeded", {
+        requestId: options.requestId,
+        applicationId: options.applicationId,
+        userId: options.userId,
+        operation: options.operation,
+        model: payload.model ?? model,
+        webMode,
+        durationMs: Date.now() - attemptStartedAt,
+        promptTokens: usage.prompt_tokens ?? 0,
+        completionTokens: usage.completion_tokens ?? 0,
+        cost: usage.cost ?? 0,
+        webSearchRequests: usage.server_tool_use?.web_search_requests ?? 0,
+        annotationCount: message.annotations?.length ?? 0,
+        contentKind: /<function_calls>|<invoke\s+name=["']?web_search|tool_calls/i.test(message.content)
+          ? "tool-call-artifact"
+          : "text",
+      });
       return {
         content: message.content,
         model: payload.model ?? model,
@@ -169,6 +203,16 @@ async function request(options: RequestOptions): Promise<{
       };
     } catch (error) {
       lastError = error;
+      logEvent("warn", "llm.attempt.failed", {
+        requestId: options.requestId,
+        applicationId: options.applicationId,
+        userId: options.userId,
+        operation: options.operation,
+        model,
+        webMode,
+        durationMs: Date.now() - attemptStartedAt,
+        error: error instanceof Error ? error.message.slice(0, 500) : String(error).slice(0, 500),
+      });
     }
   }
   throw lastError instanceof Error ? lastError : new Error(String(lastError));

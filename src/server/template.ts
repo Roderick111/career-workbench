@@ -1,17 +1,10 @@
 import { createHash } from "node:crypto";
 import { mkdir } from "node:fs/promises";
-import { basename, join } from "node:path";
-import {
-  AlignmentType,
-  Document,
-  HeadingLevel,
-  Packer,
-  Paragraph,
-  TabStopPosition,
-  TabStopType,
-  TextRun,
-} from "docx";
+import { basename, join, resolve } from "node:path";
 import PizZip from "pizzip";
+import { loadResume } from "../data";
+import { removePageBreakBefore, renderResume } from "../ooxml";
+import type { Resume } from "../types";
 import type { TemplateParagraph, TemplateSlot, WebProfile } from "../web-types";
 import { artifactsDir } from "./db";
 
@@ -71,6 +64,7 @@ export async function renderMappedTemplate(
   for (const [part, file] of Object.entries(zip.files)) {
     if (!PART_PATTERN.test(part) || file.dir) continue;
     let xml = file.asText();
+    if (part === "word/document.xml") xml = removePageBreakBefore(xml, "ReloFrance");
     let paragraphIndex = 0;
     xml = xml.replace(PARAGRAPH_PATTERN, (paragraph) => {
       const mapping = grouped.get(`${part}:${paragraphIndex++}`);
@@ -107,87 +101,63 @@ export async function renderMappedTemplate(
   new PizZip(await Bun.file(targetPath).arrayBuffer());
 }
 
-export async function createStarterTemplate(userId: string, profile: WebProfile): Promise<string> {
+export async function createStarterTemplate(userId: string): Promise<string> {
   const directory = join(artifactsDir, userId, "templates");
   await mkdir(directory, { recursive: true });
   const path = join(directory, `starter-${crypto.randomUUID()}.docx`);
-  const children: Paragraph[] = [
-    new Paragraph({
-      alignment: AlignmentType.CENTER,
-      children: [new TextRun({ text: profile.personal.name || "Your name", bold: true, size: 42 })],
-    }),
-    new Paragraph({
-      alignment: AlignmentType.CENTER,
-      children: [new TextRun(profile.personal.headline || "Professional headline")],
-    }),
-    new Paragraph({
-      alignment: AlignmentType.CENTER,
-      children: [
-        new TextRun(
-          [profile.personal.location, profile.personal.phone, profile.personal.email]
-            .filter(Boolean)
-            .join(" | ") || "City | Phone | Email",
-        ),
-      ],
-    }),
-    heading(profile, "Résumé", "Summary"),
-    new Paragraph(profile.summary || "Professional summary"),
-    heading(profile, "Expérience", "Experience"),
-  ];
-
-  for (const experience of profile.experiences) {
-    children.push(
-      new Paragraph({
-        tabStops: [{ type: TabStopType.RIGHT, position: TabStopPosition.MAX }],
-        children: [
-          new TextRun({ text: experience.company, bold: true }),
-          new TextRun(experience.context ? ` — ${experience.context}` : ""),
-          new TextRun(`\t${experience.location}`),
-        ],
-      }),
-      new Paragraph({
-        tabStops: [{ type: TabStopType.RIGHT, position: TabStopPosition.MAX }],
-        children: [
-          new TextRun(experience.role),
-          new TextRun(`\t${experience.period}`),
-        ],
-      }),
-      ...experience.bullets.map(
-        (bullet) =>
-          new Paragraph({
-            text: bullet,
-            bullet: { level: 0 },
-          }),
-      ),
-    );
-  }
-
-  if (profile.education.length) {
-    children.push(
-      heading(profile, "Formation", "Education"),
-      ...profile.education.map((item) => new Paragraph(item)),
-    );
-  }
-  if (profile.skills.length || profile.languages.length) {
-    children.push(
-      heading(profile, "Compétences", "Skills"),
-      new Paragraph([...profile.skills, ...profile.languages].join(" · ")),
-    );
-  }
-
-  const document = new Document({
-    styles: {
-      default: {
-        document: {
-          run: { font: "Aptos", size: 21 },
-          paragraph: { spacing: { after: 90 } },
-        },
-      },
-    },
-    sections: [{ children }],
-  });
-  await Bun.write(path, await Packer.toBuffer(document));
+  const resume = await loadResume(resolve("data/resume.base.yaml"));
+  await renderResume(resolve("templates/resume-template.docx"), path, resume);
   return path;
+}
+
+export async function starterTemplateProfile(): Promise<WebProfile> {
+  const resume = await loadResume(resolve("data/resume.base.yaml"));
+  return profileFromStarterResume(resume);
+}
+
+export function profileFromStarterResume(resume: Resume): WebProfile {
+  const [headline = "", location = "", phone = ""] = resume.header.line.split(" | ");
+  const skills = [
+    resume.skills.technical,
+    resume.skills.product,
+    resume.skills.finance,
+  ].flatMap(splitSkills);
+
+  return {
+    personal: {
+      name: "Daniel MEDINA",
+      headline,
+      email: "nex.mod.daniel@gmail.com",
+      phone,
+      location,
+      links: "linkedin | Portfolio web-site | Github",
+    },
+    summary: resume.summary,
+    background: "",
+    experiences: resume.experienceOrder.map((key) => ({
+      id: key,
+      ...resume.experiences[key],
+    })),
+    projects: resume.projectOrder.map((key) => {
+      const project = resume.projects[key];
+      return {
+        id: key,
+        name: project.name,
+        context: project.description,
+        period: project.date,
+        bullets: [project.bullet],
+      };
+    }),
+    education: Object.values(resume.education).map(
+      (item) => `${item.institution} — ${item.program}\t${item.date}`,
+    ),
+    certifications: Object.values(resume.certifications).map(
+      (item) => `${item.institution} — ${item.program}\t${item.date}`,
+    ),
+    skills,
+    languages: splitSkills(resume.skills.languages),
+    rules: [],
+  };
 }
 
 export async function extractDocxText(path: string): Promise<string> {
@@ -211,15 +181,6 @@ export function safeFilename(value: string, fallback = "document"): string {
     .trim()
     .slice(0, 100);
   return cleaned || fallback;
-}
-
-function heading(profile: WebProfile, french: string, english: string): Paragraph {
-  const useFrench = profile.languages.some((language) => /fran/i.test(language));
-  return new Paragraph({
-    text: useFrench ? french : english,
-    heading: HeadingLevel.HEADING_2,
-    spacing: { before: 180, after: 100 },
-  });
 }
 
 function suggestMappings(paragraphs: TemplateParagraph[], profile: WebProfile): TemplateSlot[] {
@@ -248,7 +209,24 @@ function suggestMappings(paragraphs: TemplateParagraph[], profile: WebProfile): 
       protection: isProtectedPath(item.path) ? "protected" : "tailorable",
     });
   }
-  return slots;
+  return resolveMappingConflicts(slots);
+}
+
+function splitSkills(value: string): string[] {
+  return value.split("·").map((item) => item.trim()).filter(Boolean);
+}
+
+export function resolveMappingConflicts(slots: TemplateSlot[]): TemplateSlot[] {
+  const grouped = new Map<string, TemplateSlot[]>();
+  for (const slot of slots) {
+    const key = `${slot.documentPart}:${slot.paragraphIndex}`;
+    grouped.set(key, [...(grouped.get(key) ?? []), slot]);
+  }
+  return [...grouped.values()].flatMap((group) => {
+    const whole = group.filter((slot) => slot.mode === "whole-paragraph");
+    if (!whole.length) return group;
+    return [whole.sort((a, b) => b.matchText.length - a.matchText.length)[0]];
+  });
 }
 
 function flattenProfile(profile: WebProfile): Array<{ path: string; value: string }> {
@@ -277,7 +255,9 @@ export function isProtectedPath(path: string): boolean {
   return (
     path.startsWith("personal.") ||
     /^experiences\.\d+\.(company|location|period)$/.test(path) ||
+    /^projects\.\d+\.(name|period)$/.test(path) ||
     path.startsWith("education.") ||
+    path.startsWith("certifications.") ||
     path.startsWith("languages.")
   );
 }

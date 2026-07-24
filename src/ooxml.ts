@@ -72,7 +72,7 @@ export async function buildTemplate(sourcePath: string, targetPath: string): Pro
   xml = normalizeLocationTab(xml, "{experiences.xlend.context}");
   xml = normalizeLocationTab(xml, "{experiences.brainform.context}");
   xml = normalizeLocationTab(xml, "{experiences.sally.context}");
-  xml = addPageBreakBefore(xml, "ReloFrance, Learnio &amp; Yats");
+  xml = removePageBreakBefore(xml, "ReloFrance");
 
   const projectSlots: Record<string, { description: string; date: string; bullet: string }> = {
     findr: {
@@ -125,6 +125,7 @@ export async function buildTemplate(sourcePath: string, targetPath: string): Pro
   xml = replaceText(xml, "JTBD · Feuilles de Route Produit · Agile/Scrum · Gestion des Parties Prenantes ", "{skills.product}");
   xml = replaceText(xml, "Modélisation Financière · Élaboration de Cas d'Affaires · Exigences Réglementaires · Due Diligence", "{skills.finance}");
   xml = normalizeBodyFontOverrides(xml);
+  xml = removePageBreakBefore(xml, "ReloFrance");
 
   zip.file(DOCUMENT_XML, xml);
   await Bun.write(targetPath, zip.generate({ type: "uint8array" }));
@@ -137,6 +138,7 @@ export async function renderResume(templatePath: string, targetPath: string, res
   let xml = document.asText();
 
   xml = normalizeBodyFontOverrides(xml);
+  xml = removePageBreakBefore(xml, "ReloFrance");
   xml = ensureProductLabelPlaceholder(xml);
   xml = normalizeLocationTab(xml, "{experiences.xlend.context}");
   xml = normalizeLocationTab(xml, "{experiences.brainform.context}");
@@ -290,20 +292,12 @@ function ensureProductLabelPlaceholder(xml: string): string {
   return replaceText(xml, "Gestion de Produit", "{skills.productLabel}");
 }
 
-function addPageBreakBefore(xml: string, marker: string): string {
-  let changed = false;
-  const pageBreak = '<w:pageBreakBefore w:val="1"/>';
-  const result = xml.replace(/<w:p(?:\s[^>]*)?>[\s\S]*?<\/w:p>/g, (paragraph) => {
-    if (!paragraph.includes(marker)) return paragraph;
-    changed = true;
-    if (paragraph.includes(pageBreak)) return paragraph;
-    if (/<w:pStyle\b[^>]*\/>/.test(paragraph)) {
-      return paragraph.replace(/(<w:pStyle\b[^>]*\/>)/, `$1${pageBreak}`);
-    }
-    return paragraph.replace("<w:pPr>", `<w:pPr>${pageBreak}`);
-  });
-  if (!changed) throw new Error(`Template paragraph not found for page break: ${marker}`);
-  return result;
+export function removePageBreakBefore(xml: string, marker: string): string {
+  return xml.replace(/<w:p(?:\s[^>]*)?>[\s\S]*?<\/w:p>/g, (paragraph) =>
+    paragraph.includes(marker)
+      ? paragraph.replace(/<w:pageBreakBefore\b[^>]*\/>/g, "")
+      : paragraph,
+  );
 }
 
 function removeMarkedParagraphs(xml: string): string {

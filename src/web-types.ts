@@ -10,6 +10,14 @@ export interface WebExperience {
   bullets: string[];
 }
 
+export interface WebProject {
+  id: string;
+  name: string;
+  context: string;
+  period: string;
+  bullets: string[];
+}
+
 export interface WebProfile {
   personal: {
     name: string;
@@ -22,7 +30,9 @@ export interface WebProfile {
   summary: string;
   background: string;
   experiences: WebExperience[];
+  projects: WebProject[];
   education: string[];
+  certifications: string[];
   skills: string[];
   languages: string[];
   rules: string[];
@@ -104,7 +114,9 @@ export const EMPTY_PROFILE: WebProfile = {
   summary: "",
   background: "",
   experiences: [],
+  projects: [],
   education: [],
+  certifications: [],
   skills: [],
   languages: [],
   rules: [],

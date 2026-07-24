@@ -21,14 +21,24 @@ import {
   extractDocxText,
   isProtectedPath,
   renderMappedTemplate,
+  resolveMappingConflicts,
   safeFilename,
+  starterTemplateProfile,
 } from "./template";
 import {
+  beginOperation,
+  finishOperation,
+  logEvent,
+  updateOperationInput,
+} from "./observability";
+import { artifactHeaders } from "./download";
+import {
   consumeWorkflowCredit,
-  extractProfileFromText,
+  reconcileProfileFromText,
   startWorker,
   stopWorker,
   validateTailoringProposal,
+  validateProfile,
 } from "./workflow";
 
 await migrateAuthSchema();
@@ -36,9 +46,34 @@ migrateApplicationSchema();
 
 type Variables = {
   session: AuthSession | null;
+  requestId: string;
 };
 
 const app = new Hono<{ Variables: Variables }>();
+
+app.use("/api/*", async (c, next) => {
+  const requestId = c.req.header("x-request-id") || id();
+  const startedAt = Date.now();
+  c.set("requestId", requestId);
+  c.header("x-request-id", requestId);
+  logEvent("info", "http.request.started", {
+    requestId,
+    method: c.req.method,
+    path: c.req.path,
+  });
+  try {
+    await next();
+  } finally {
+    logEvent("info", "http.request.completed", {
+      requestId,
+      method: c.req.method,
+      path: c.req.path,
+      status: c.res.status,
+      durationMs: Date.now() - startedAt,
+      userId: c.get("session")?.user.id,
+    });
+  }
+});
 
 app.use(
   "/api/*",
@@ -127,50 +162,131 @@ app.get("/api/profile", (c) => {
   const row = db.query("SELECT content_json FROM profiles WHERE user_id = ?").get(userId) as
     | { content_json: string }
     | null;
-  return c.json(row ? json<WebProfile>(row.content_json, EMPTY_PROFILE) : EMPTY_PROFILE);
+  return c.json(
+    validateProfile(
+      row
+        ? json<WebProfile>(row.content_json, structuredClone(EMPTY_PROFILE))
+        : structuredClone(EMPTY_PROFILE),
+    ),
+  );
 });
 
 app.put("/api/profile", async (c) => {
   const userId = requiredSession(c).user.id;
-  const profile = (await c.req.json()) as WebProfile;
-  if (!profile?.personal || !Array.isArray(profile.experiences)) {
-    return c.json({ error: "Invalid profile." }, 400);
+  try {
+    const profile = validateProfile((await c.req.json()) as WebProfile);
+    saveProfile(userId, profile);
+    return c.json({ ok: true, savedAt: now() });
+  } catch (error) {
+    return c.json({ error: message(error) }, 400);
   }
-  const timestamp = now();
-  db.query(
-    `INSERT INTO profiles (user_id, content_json, created_at, updated_at)
-     VALUES (?, ?, ?, ?)
-     ON CONFLICT(user_id) DO UPDATE SET content_json = excluded.content_json, updated_at = excluded.updated_at`,
-  ).run(userId, JSON.stringify(profile), timestamp, timestamp);
-  return c.json({ ok: true });
 });
 
 app.post("/api/profile/extract", async (c) => {
   const userId = requiredSession(c).user.id;
-  const form = await c.req.formData();
-  const file = form.get("file");
-  const pasted = String(form.get("text") ?? "");
-  let text = pasted;
-  if (file instanceof File && file.size) {
-    if (!file.name.toLowerCase().endsWith(".docx")) {
-      return c.json({ error: "CV import accepts DOCX or pasted text." }, 400);
-    }
-    const directory = join(artifactsDir, userId, "imports");
-    await mkdir(directory, { recursive: true });
-    const path = join(directory, `${id()}-${safeFilename(file.name)}`);
-    await Bun.write(path, file);
-    text = await extractDocxText(path);
+  const requestId = c.get("requestId");
+  const operation = beginOperation(userId, "profile_reconcile", requestId);
+  if (!operation) {
+    return c.json(
+      {
+        error: "Profile update is already running. Wait for the current analysis to finish.",
+        requestId,
+      },
+      409,
+    );
   }
-  if (text.trim().length < 50) return c.json({ error: "Not enough CV text." }, 400);
   try {
-    return c.json(await extractProfileFromText(userId, text));
+    const form = await c.req.formData();
+    const file = form.get("file");
+    const pasted = String(form.get("text") ?? "");
+    const sourceMode = form.get("mode") === "context" ? "context" : "profile";
+    let text = pasted;
+    let inputName = pasted.trim() ? "pasted-text" : undefined;
+    let inputBytes = new TextEncoder().encode(pasted).byteLength;
+    if (file instanceof File && file.size) {
+      const lowerName = file.name.toLowerCase();
+      if (!lowerName.endsWith(".docx") && !lowerName.endsWith(".md") && !lowerName.endsWith(".txt")) {
+        throw new Error("Import accepts DOCX, Markdown, TXT, or pasted text.");
+      }
+      const directory = join(artifactsDir, userId, "imports");
+      await mkdir(directory, { recursive: true });
+      const path = join(directory, `${id()}-${safeFilename(file.name)}`);
+      await Bun.write(path, file);
+      text = lowerName.endsWith(".docx") ? await extractDocxText(path) : await file.text();
+      inputName = safeFilename(file.name);
+      inputBytes = file.size;
+    }
+    updateOperationInput(operation, {
+      name: inputName,
+      bytes: inputBytes,
+      characters: text.length,
+    });
+    if (text.trim().length < 50) throw new Error("Not enough source text.");
+
+    if (sourceMode === "context") {
+      const current = loadProfile(userId);
+      const saved = !profileHasContent(current);
+      const title = inputName && inputName !== "pasted-text" ? `## ${inputName}\n\n` : "";
+      const addition = `${title}${text.trim()}`;
+      const profile = validateProfile({
+        ...current,
+        background: [current.background.trim(), addition].filter(Boolean).join("\n\n---\n\n"),
+      });
+      if (saved) saveProfile(userId, profile);
+      const details = {
+        sourceMode,
+        saved,
+        contextCharactersAdded: addition.length,
+      };
+      finishOperation(operation, "succeeded", details);
+      return c.json({
+        profile,
+        mode: sourceMode,
+        saved,
+        warnings: [],
+        reviewPaths: [],
+        requestId,
+        durationMs: Date.now() - operation.startedAt,
+      });
+    }
+
+    const current = loadProfile(userId);
+    const currentHasContent = profileHasContent(current);
+    const result = await reconcileProfileFromText(userId, current, text, requestId);
+    const saved = !currentHasContent;
+    if (saved) saveProfile(userId, result.profile);
+    const details = {
+      sourceMode,
+      model: result.model,
+      warningCount: result.warnings.length,
+      saved,
+      experienceCount: result.profile.experiences.length,
+      projectCount: result.profile.projects.length,
+      educationCount: result.profile.education.length,
+      certificationCount: result.profile.certifications.length,
+      skillCount: result.profile.skills.length,
+      languageCount: result.profile.languages.length,
+    };
+    finishOperation(operation, "succeeded", details);
+    return c.json({
+      profile: result.profile,
+      mode: sourceMode,
+      saved,
+      warnings: result.warnings,
+      reviewPaths: result.reviewPaths,
+      requestId,
+      durationMs: Date.now() - operation.startedAt,
+    });
   } catch (error) {
-    return c.json({ error: message(error) }, 502);
+    finishOperation(operation, "failed", {}, error);
+    const status = /Import accepts|Not enough source text/.test(message(error)) ? 400 : 502;
+    return c.json({ error: message(error), requestId }, status);
   }
 });
 
-app.get("/api/templates", (c) => {
+app.get("/api/templates", async (c) => {
   const userId = requiredSession(c).user.id;
+  await ensureDefaultTemplate(userId);
   const rows = db
     .query(
       `SELECT id, name, source_filename, mapping_json, analysis_json, status, created_at, updated_at
@@ -190,9 +306,7 @@ app.get("/api/templates", (c) => {
 
 app.post("/api/templates/starter", async (c) => {
   const userId = requiredSession(c).user.id;
-  const profile = loadProfile(userId);
-  const sourcePath = await createStarterTemplate(userId, profile);
-  return c.json(await saveTemplate(userId, "Private starter", sourcePath, "starter.docx", profile), 201);
+  return c.json(await ensureDefaultTemplate(userId), 200);
 });
 
 app.post("/api/templates/upload", async (c) => {
@@ -221,13 +335,14 @@ app.put("/api/templates/:id/mapping", async (c) => {
   if (!Array.isArray(body.slots)) return c.json({ error: "slots must be an array." }, 400);
   const template = ownedTemplate(templateId, userId);
   try {
-    validateSlots(body.slots);
+    const slots = resolveMappingConflicts(body.slots);
+    validateSlots(slots);
     const testPath = join(artifactsDir, userId, "templates", `${templateId}-validation.docx`);
-    await renderMappedTemplate(template.source_path, testPath, body.slots, loadProfile(userId));
+    await renderMappedTemplate(template.source_path, testPath, slots, loadProfile(userId));
     db.query(
       "UPDATE templates SET mapping_json = ?, status = ?, updated_at = ? WHERE id = ? AND user_id = ?",
-    ).run(JSON.stringify(body.slots), body.activate ? "active" : "draft", now(), templateId, userId);
-    return c.json({ ok: true });
+    ).run(JSON.stringify(slots), body.activate ? "active" : "draft", now(), templateId, userId);
+    return c.json({ ok: true, repairedMappings: body.slots.length - slots.length });
   } catch (error) {
     return c.json({ error: message(error) }, 400);
   }
@@ -329,6 +444,9 @@ app.post("/api/applications", async (c) => {
   if (!body.company?.trim() || !body.role?.trim() || !body.jobText?.trim()) {
     return c.json({ error: "Company, role, and job post are required." }, 400);
   }
+  if (!profileHasContent(loadProfile(userId))) {
+    return c.json({ error: "Complete your profile before creating an application." }, 400);
+  }
   if (body.jobText.length > 30_000) return c.json({ error: "Job post exceeds 30,000 characters." }, 400);
   if (!body.templateId) return c.json({ error: "Select an active template." }, 400);
   const chosenTemplate = ownedTemplate(body.templateId, userId);
@@ -368,11 +486,43 @@ app.get("/api/applications/:id", (c) => {
        FROM artifacts WHERE application_id = ? AND user_id = ? ORDER BY created_at DESC`,
     )
     .all(c.req.param("id"), userId);
+  let proposal: TailoringProposal | null = application.proposal_json
+    ? json<TailoringProposal>(String(application.proposal_json), { edits: [], warnings: [] })
+    : null;
+  if (proposal && application.template_id) {
+    const template = db
+      .query("SELECT mapping_json FROM templates WHERE id = ? AND user_id = ?")
+      .get(String(application.template_id), userId) as { mapping_json: string } | null;
+    if (template) {
+      const allowed = new Set(
+        json<TemplateSlot[]>(template.mapping_json, [])
+          .filter((slot) => slot.protection === "tailorable")
+          .map((slot) => slot.fieldPath),
+      );
+      try {
+        proposal = validateTailoringProposal(proposal, loadProfile(userId), allowed);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "Stored proposal is stale.";
+        logEvent("warn", "application.proposal.stale", {
+          applicationId: application.id,
+          userId,
+          message,
+        });
+        proposal = {
+          ...proposal,
+          warnings: [
+            ...proposal.warnings,
+            "Stored proposal no longer matches the current profile; regenerate it before using it.",
+          ],
+        };
+      }
+    }
+  }
   return c.json({
     ...application,
     research: json(String(application.research_json ?? ""), null),
     fit: json(String(application.fit_json ?? ""), null),
-    proposal: json(String(application.proposal_json ?? ""), null),
+    proposal,
     research_json: undefined,
     fit_json: undefined,
     proposal_json: undefined,
@@ -416,6 +566,27 @@ app.put("/api/applications/:id/review", async (c) => {
   return c.json({ ok: true });
 });
 
+app.put("/api/applications/:id/comment", async (c) => {
+  const userId = requiredSession(c).user.id;
+  const application = db
+    .query("SELECT id, status FROM applications WHERE id = ? AND user_id = ?")
+    .get(c.req.param("id"), userId) as { id: string; status: string } | null;
+  if (!application) return c.json({ error: "Application not found." }, 404);
+  if (!["research_ready", "research_approved", "proposal_ready", "proposal_approved", "complete"].includes(application.status)) {
+    return c.json({ error: "Additional instructions can be edited after fit research is ready." }, 409);
+  }
+  const body = await c.req.json<{ comment?: unknown }>();
+  const comment = typeof body.comment === "string" ? body.comment.trim() : "";
+  if (comment.length > 5000) return c.json({ error: "Additional instructions are limited to 5,000 characters." }, 400);
+  db.query("UPDATE applications SET user_comment = ?, updated_at = ? WHERE id = ? AND user_id = ?").run(
+    comment,
+    now(),
+    application.id,
+    userId,
+  );
+  return c.json({ ok: true, savedAt: now(), comment });
+});
+
 app.post("/api/applications/:id/actions/:action", (c) => {
   const userId = requiredSession(c).user.id;
   const application = ownedApplication(c.req.param("id"), userId);
@@ -426,6 +597,7 @@ app.post("/api/applications/:id/actions/:action", (c) => {
     tailor: ["research_approved", "tailor_queued"],
     approve_proposal: ["proposal_ready", "proposal_approved"],
     generate: ["proposal_approved", "generate_queued"],
+    regenerate: ["complete", "tailor_queued"],
     retry_research: ["failed", "research_queued"],
   };
   const transition = transitions[action];
@@ -442,6 +614,12 @@ app.post("/api/applications/:id/actions/:action", (c) => {
       application.id,
       userId,
     );
+    if (action === "regenerate") {
+      db.query("UPDATE applications SET proposal_json = NULL, tailored_profile_json = NULL WHERE id = ? AND user_id = ?").run(
+        application.id,
+        userId,
+      );
+    }
     return c.json({ ok: true });
   } catch (error) {
     return c.json({ error: message(error) }, 429);
@@ -519,6 +697,30 @@ app.get("/api/admin/users", async (c) => {
   });
 });
 
+app.get("/api/admin/operations", (c) => {
+  requireAdmin(c);
+  const rows = db
+    .query(
+      `SELECT operation_logs.id, operation_logs.request_id, operation_logs.user_id,
+        operation_logs.operation, operation_logs.status, operation_logs.input_name,
+        operation_logs.input_bytes, operation_logs.input_characters,
+        operation_logs.details_json, operation_logs.error, operation_logs.started_at,
+        operation_logs.completed_at, operation_logs.duration_ms, user.email
+       FROM operation_logs
+       LEFT JOIN user ON user.id = operation_logs.user_id
+       ORDER BY operation_logs.started_at DESC
+       LIMIT 100`,
+    )
+    .all() as Array<Record<string, unknown>>;
+  return c.json(
+    rows.map((row) => ({
+      ...row,
+      details: json(String(row.details_json), {}),
+      details_json: undefined,
+    })),
+  );
+});
+
 app.put("/api/admin/users/:id/quota", async (c) => {
   requireAdmin(c);
   const body = await c.req.json<{ quota?: number }>();
@@ -586,7 +788,35 @@ function loadProfile(userId: string): WebProfile {
   const row = db.query("SELECT content_json FROM profiles WHERE user_id = ?").get(userId) as
     | { content_json: string }
     | null;
-  return row ? json<WebProfile>(row.content_json, structuredClone(EMPTY_PROFILE)) : structuredClone(EMPTY_PROFILE);
+  return validateProfile(
+    row
+      ? json<WebProfile>(row.content_json, structuredClone(EMPTY_PROFILE))
+      : structuredClone(EMPTY_PROFILE),
+  );
+}
+
+function saveProfile(userId: string, profile: WebProfile): void {
+  const timestamp = now();
+  db.query(
+    `INSERT INTO profiles (user_id, content_json, created_at, updated_at)
+     VALUES (?, ?, ?, ?)
+     ON CONFLICT(user_id) DO UPDATE SET content_json = excluded.content_json, updated_at = excluded.updated_at`,
+  ).run(userId, JSON.stringify(validateProfile(profile)), timestamp, timestamp);
+}
+
+export function profileHasContent(profile: WebProfile): boolean {
+  return Boolean(
+    profile.personal.name.trim() ||
+      profile.summary.trim() ||
+      profile.background.trim() ||
+      profile.experiences.length ||
+      profile.projects.length ||
+      profile.education.length ||
+      profile.certifications.length ||
+      profile.skills.length ||
+      profile.languages.length ||
+      profile.rules.length,
+  );
 }
 
 async function saveTemplate(
@@ -595,6 +825,7 @@ async function saveTemplate(
   sourcePath: string,
   sourceFilename: string,
   profile: WebProfile,
+  status = "draft",
 ): Promise<Record<string, unknown>> {
   const analysis = await analyzeTemplate(sourcePath, profile);
   if (analysis.unsupported.length) throw new Error(analysis.unsupported.join("; "));
@@ -603,7 +834,7 @@ async function saveTemplate(
   db.query(
     `INSERT INTO templates
       (id, user_id, name, source_filename, source_path, mapping_json, analysis_json, status, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, 'draft', ?, ?)`,
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     templateId,
     userId,
@@ -612,10 +843,53 @@ async function saveTemplate(
     sourcePath,
     JSON.stringify(analysis.suggestedSlots),
     JSON.stringify(analysis),
+    status,
     timestamp,
     timestamp,
   );
-  return { id: templateId, name, analysis, mapping: analysis.suggestedSlots, status: "draft" };
+  return { id: templateId, name, analysis, mapping: analysis.suggestedSlots, status };
+}
+
+async function ensureDefaultTemplate(userId: string): Promise<Record<string, unknown>> {
+  const existing = db
+    .query(
+      `SELECT id, name, source_filename, source_path, mapping_json, analysis_json, status
+       FROM templates
+       WHERE user_id = ? AND source_filename = 'resume-template.docx'
+       ORDER BY updated_at DESC LIMIT 1`,
+    )
+    .get(userId) as Record<string, unknown> | null;
+  if (existing) {
+    let mapping = json<TemplateSlot[]>(String(existing.mapping_json), []);
+    let analysis: unknown = json(String(existing.analysis_json), {});
+    if (existing.status !== "active" || mapping.length === 0) {
+      const rebuilt = await analyzeTemplate(String(existing.source_path), await starterTemplateProfile());
+      mapping = rebuilt.suggestedSlots;
+      analysis = rebuilt;
+      db.query(
+        "UPDATE templates SET mapping_json = ?, analysis_json = ?, status = 'active', updated_at = ? WHERE id = ?",
+      ).run(JSON.stringify(mapping), JSON.stringify(analysis), now(), String(existing.id));
+    }
+    return {
+      ...existing,
+      status: "active",
+      mapping,
+      analysis,
+      source_path: undefined,
+      mapping_json: undefined,
+      analysis_json: undefined,
+    };
+  }
+
+  const sourcePath = await createStarterTemplate(userId);
+  return saveTemplate(
+    userId,
+    "Default template",
+    sourcePath,
+    "resume-template.docx",
+    await starterTemplateProfile(),
+    "active",
+  );
 }
 
 function ownedTemplate(templateId: string, userId: string): {
@@ -690,13 +964,7 @@ function hashToken(token: string): string {
 function download(path: string, filename: string): Response {
   const file = Bun.file(path);
   return new Response(file, {
-    headers: {
-      "Content-Type": filename.endsWith(".docx")
-        ? "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-        : "application/octet-stream",
-      "Content-Disposition": `attachment; filename="${safeFilename(filename)}"`,
-      "Content-Length": String(file.size),
-    },
+    headers: artifactHeaders(filename, file.size),
   });
 }
 

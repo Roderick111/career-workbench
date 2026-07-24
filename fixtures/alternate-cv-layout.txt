@@ -1,0 +1,21 @@
+Alex Example
+alex@example.test · Marseille · example.test
+
+TOOLS & METHODS
+TypeScript, SQL, Figma, product discovery, user research
+
+SELECTED WORK
+Inventory Forecasting — 2024
+Built a forecasting workflow used by retail operations teams.
+
+ACADEMIC BACKGROUND
+MSc Human-Computer Interaction — Example University — 2022
+
+LANGUAGE KNOWLEDGE
+English (C1), Spanish
+
+EMPLOYMENT HISTORY
+Example Systems — Marseille
+Product Manager | 2022–Present
+Led discovery interviews and translated findings into delivery priorities.
+Coordinated designers and developers through launch.

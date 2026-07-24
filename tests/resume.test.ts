@@ -130,16 +130,15 @@ describe("resume rendering", () => {
     expect(xml).not.toContain("Arial Unicode MS");
   });
 
-  test("starts oldest experience block on page two", async () => {
+  test("does not force the oldest experience onto page two", async () => {
     const xml = new PizZip(await Bun.file(output).arrayBuffer())
       .file("word/document.xml")
       ?.asText();
     const paragraph = xml
       ?.match(/<w:p(?:\s[^>]*)?>[\s\S]*?<\/w:p>/g)
       ?.find((item) => item.includes("ReloFrance"));
-    expect(paragraph).toContain('<w:pageBreakBefore w:val="1"/>');
+    expect(paragraph).not.toContain("<w:pageBreakBefore");
   });
-
 });
 
 describe("proposal guardrails", () => {
