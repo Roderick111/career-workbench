@@ -12,16 +12,151 @@ See [WEB.md](WEB.md) for web setup and deployment.
 
 ## Architecture
 
-- private profile sources: local evidence and editable document template.
-- target brief: requirements and context for one application.
-- proposal JSON: temporary, reviewable document edit.
-- output YAML, review, and DOCX: approved application package.
+One doctrine, two interfaces. CLI and web share the same product rules (evidence
+gates, protected facts, reviewable edits, two-page cap) but use different
+runtimes and data models.
 
-YAML does not replace DOCX formatting. It controls only mutable text, ordering,
-and selection. Company names, dates, locations, education, certifications,
-contact details, and existing metrics remain protected. Startup role titles are
-flexible positioning labels and may be reframed from evidenced responsibilities;
-every change remains reviewable. Output is capped at two readable pages.
+### Shared contract
+
+Pipeline shape for every application:
+
+1. **Profile sources** — career evidence (YAML base or web profile) plus a DOCX
+   visual master.
+2. **Target brief** — one job description and company context.
+3. **Proposal** — temporary, reviewable document edits (not a final CV).
+4. **Approved package** — tailored content, review/diff, and generated DOCX.
+
+DOCX stays the visual master. Structured data only controls mutable text,
+ordering, and selection. Company names, dates, locations, education,
+certifications, contact details, and existing metrics stay protected. Startup
+role titles are flexible positioning labels and may be reframed from evidenced
+responsibilities; every change remains reviewable. Output is capped at two
+readable pages.
+
+Human approval is mandatory before CV edits and before document generation.
+Stage 1 research/fit approval is required before Stage 2 tailoring. See
+[WORKFLOW.md](WORKFLOW.md).
+
+### Stack
+
+- **Runtime:** Bun
+- **API:** Hono (web)
+- **UI:** Vite + React (web SPA served by Hono in production)
+- **Auth:** Better Auth, invite-only registration
+- **Store:** SQLite (WAL) under `DATA_DIR` for web; local files for CLI
+- **LLM:** OpenRouter-compatible chat (JSON proposals, research, profile
+  reconciliation)
+- **Documents:** PizZip OOXML read/write; CLI PDF via ONLYOFFICE
+
+### CLI path (personal, local)
+
+File-based, synchronous, single-owner. Intended for the local workspace only.
+
+```
+jobs/<role>.md
+  + data/resume.base.yaml
+  + my_background.md / GUIDELINES.md
+        │
+        ▼
+  LLM proposal JSON  (or fixtures/*.proposal.json)
+        │
+        ▼
+  validate → apply → review.md + resume.yaml
+        │  human confirm
+        ▼
+  templates/resume-template.docx → output/<slug>/resume.docx
+        │  optional
+        ▼
+  scripts/export-pdf.ts (ONLYOFFICE)
+```
+
+| Module | Role |
+|--------|------|
+| `src/cli.ts` | Entry: load base, request/load proposal, review, render |
+| `src/types.ts` | `Resume` / `Proposal` shapes |
+| `src/data.ts` | YAML load/validate, proposal apply with hard field protection |
+| `src/llm.ts` | One-shot proposal request |
+| `src/review.ts` | Human-readable before/after review |
+| `src/ooxml.ts` | Fixed-layout template placeholders and DOCX render |
+
+CLI template slots are hardcoded for the personal CV layout. Run
+`bun run personalize` with `--job` and optional `--proposal` / `--approve`.
+
+### Web path (invite-only multi-user)
+
+Additive product. CLI remains independent. Each user owns an isolated profile,
+templates, Markdown documents, applications, and artifacts under SQLite +
+`DATA_DIR/users/`.
+
+```
+Browser (Vite dev :5173 / static SPA in prod)
+        │  /api/*
+        ▼
+Hono API (Bun :3000)
+  ├── better-auth, invites, session middleware
+  ├── profile / templates / documents / applications / artifacts
+  ├── admin (invites, quotas, operation logs)
+  └── in-process worker (research → tailor → generate)
+        │
+        ▼
+SQLite + user DOCX files          OpenRouter (LLM + web research)
+```
+
+| Module | Role |
+|--------|------|
+| `src/server/index.ts` | HTTP API, auth gates, static SPA |
+| `src/server/workflow.ts` | Application status machine, LLM jobs, validators |
+| `src/server/template.ts` | Upload/analyze DOCX, mapping, mapped render |
+| `src/server/openrouter.ts` | Provider adapter (JSON + research fallbacks) |
+| `src/server/db.ts` | Schema, paths, SQLite access |
+| `src/server/auth.ts` | Better Auth setup |
+| `src/web/App.tsx` | Full client UI |
+| `src/web-types.ts` | `WebProfile`, fit report, edits, statuses |
+
+Core entities:
+
+| Entity | Purpose |
+|--------|---------|
+| **profiles** | Canonical career knowledge (`WebProfile` JSON) |
+| **templates** | User DOCX + slot mapping (protected vs tailorable) |
+| **documents** | Reusable Markdown (e.g. company research by company key) |
+| **applications** | One job attempt: status, fit, proposal, errors |
+| **artifacts** | Generated DOCX on disk + download metadata |
+
+Application status machine (mirrors the three workflow stages):
+
+```
+draft
+  → research_queued → researching → research_ready
+  → research_approved          (user gate)
+  → tailor_queued → tailoring → proposal_ready
+  → proposal_approved          (user gate)
+  → generate_queued → generating → complete
+  ↘ failed
+```
+
+Web template model is generic: upload or starter DOCX, map paragraphs to profile
+paths, then render only mapped tailorable slots. Profile import can reconcile
+structured content via LLM or append raw context notes; nothing overwrites the
+saved profile without explicit user save.
+
+Production: single container, external `proxy` network, named volume for
+`/data`. Web path does not generate PDF; users preview DOCX in-browser and
+download. Details: [WEB.md](WEB.md).
+
+### CLI vs web
+
+| | CLI | Web |
+|--|-----|-----|
+| Audience | Single local owner | Invite-only collaborators |
+| Content model | `Resume` YAML | `WebProfile` JSON |
+| Template | Fixed personal OOXML slots | Per-user mapped DOCX |
+| Persistence | Files under repo workspace | SQLite + `DATA_DIR` |
+| Async work | None (sync CLI) | In-process status worker |
+| PDF | ONLYOFFICE script | Not in product path |
+
+Do not treat the two paths as one codebase. Share doctrine and prompts
+carefully; keep personal career files out of git (see Private inputs).
 
 ## Private inputs
 
