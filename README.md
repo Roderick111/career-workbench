@@ -2,6 +2,14 @@
 
 Evidence-first CV personalization that keeps the existing DOCX design.
 
+Two separate interfaces share CV principles:
+
+- Existing CLI remains personal, local, and formatting-preserving.
+- Invite-only web app supports friends with isolated profiles, private DOCX
+  templates, reusable Markdown research, and downloadable generated files.
+
+See [WEB.md](WEB.md) for web setup and deployment.
+
 ## Architecture
 
 - `my_background.md`: evidence reservoir for truthful positioning.

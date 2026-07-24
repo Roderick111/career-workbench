@@ -1,0 +1,9 @@
+.git
+.env
+.DS_Store
+node_modules
+dist
+output
+data/runtime
+*.pdf
+*.docx

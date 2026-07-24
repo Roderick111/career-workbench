@@ -1,0 +1,46 @@
+services:
+  app:
+    build:
+      context: .
+      target: runtime
+    container_name: job-search
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      DATA_DIR: /data
+      VIRTUAL_HOST: ${VIRTUAL_HOST:-cv.beautiful-apps.com}
+      VIRTUAL_PORT: ${VIRTUAL_PORT:-3000}
+      LETSENCRYPT_HOST: ${LETSENCRYPT_HOST:-cv.beautiful-apps.com}
+    volumes:
+      - job_search_data:/data
+    networks:
+      - proxy
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "bun",
+          "-e",
+          "fetch('http://localhost:3000/api/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))",
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  job_search_data:
+
+networks:
+  proxy:
+    external: true
